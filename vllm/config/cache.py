@@ -176,6 +176,49 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    # ---- SKIVE (Strategic KV Inference via Volatile Eviction) ----
+    # When ``skive_enabled`` is True, vLLM runs the SKIVE fused
+    # single-pass attention+scoring decode kernel and applies a per-sequence
+    # volatile-eviction policy that overwrites the lowest-scoring KV
+    # blocks once the sequence exceeds ``kv_budget``. Disabled by
+    # default and zero-overhead (the SKIVE constexpr path short-circuits
+    # to the original unified-attention kernel) when off.
+    skive_enabled: bool = False
+    """If True, enable SKIVE fused single-pass decode attention + L1
+    importance scoring, and a per-sequence volatile-eviction policy
+    that caps each sequence's KV footprint at ``skive_kv_budget`` tokens.
+    Default: False. When False the standard unified-attention decode
+    kernel is used and no eviction occurs."""
+
+    skive_kv_budget: int = 2048
+    """Per-sequence KV budget (in tokens) when SKIVE is enabled.
+    Once a sequence's KV cache exceeds this many tokens, the
+    lowest-scoring full block (of size ``block_size``) is evicted on
+    subsequent decode steps. Must be a multiple of ``block_size`` for
+    the block-wise eviction policy to be lossless; otherwise the budget
+    is rounded down to the nearest multiple with a runtime warning."""
+
+    skive_num_sink_tokens: int = 4
+    """Number of leading tokens protected from eviction (attention
+    sinks / initial system prompt). Tokens at positions
+    [0, skive_num_sink_tokens) of the logical sequence are never
+    overwritten, regardless of their SKIVE score."""
+
+    skive_score_aggregation: Literal["mean", "ema"] = "mean"
+    """How to combine the per-(token, kv-head) L1 scores produced by
+    the fused decode kernel across the N transformer layers.
+
+    - "mean": divide the sum of per-layer scores by N. Single-pass,
+      deterministic, GPU-only. Default.
+    - "ema": exponential moving average across steps. Stateful
+      (one float per token) and slightly more accurate on long
+      reasoning trajectories at the cost of one extra state tensor.
+    """
+
+    skive_score_ema_alpha: float = 0.9
+    """Smoothing factor for the "ema" score aggregation. Only used
+    when ``skive_score_aggregation == "ema"``."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

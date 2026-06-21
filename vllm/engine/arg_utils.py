@@ -506,6 +506,14 @@ class EngineArgs:
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
+    # SKIVE — Strategic KV Inference via Volatile Eviction (decode-side).
+    # Zero-overhead when disabled. CLI flags below wire these into
+    # CacheConfig.
+    skive_enabled: bool = False
+    skive_kv_budget: int = 2048
+    skive_num_sink_tokens: int = 4
+    skive_score_aggregation: Literal["mean", "ema"] = "mean"
+    skive_score_ema_alpha: float = 0.9
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -1167,6 +1175,24 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        # SKIVE flags (all opt-in; default off → zero regression on the
+        # standard decode path).
+        cache_group.add_argument(
+            "--skive-enabled", **cache_kwargs["skive_enabled"]
+        )
+        cache_group.add_argument(
+            "--skive-kv-budget", **cache_kwargs["skive_kv_budget"]
+        )
+        cache_group.add_argument(
+            "--skive-num-sink-tokens", **cache_kwargs["skive_num_sink_tokens"]
+        )
+        cache_group.add_argument(
+            "--skive-score-aggregation",
+            **cache_kwargs["skive_score_aggregation"],
+        )
+        cache_group.add_argument(
+            "--skive-score-ema-alpha", **cache_kwargs["skive_score_ema_alpha"]
+        )
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1775,6 +1801,11 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            skive_enabled=self.skive_enabled,
+            skive_kv_budget=self.skive_kv_budget,
+            skive_num_sink_tokens=self.skive_num_sink_tokens,
+            skive_score_aggregation=self.skive_score_aggregation,
+            skive_score_ema_alpha=self.skive_score_ema_alpha,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):
