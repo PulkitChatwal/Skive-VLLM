@@ -445,6 +445,19 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def evict_blocks_derefed_for_skive(
+        self, block_ids: set[int]
+    ) -> tuple[list[int], list[int]]:
+        """SKIVE wrapper: deref a set of physical blocks.
+
+        Returns ``(freed, skipped)`` where ``freed`` are block IDs that
+        were successfully evicted and ``skipped`` are block IDs that
+        could not be evicted (because ``ref_cnt > 1``, indicating
+        prefix-cache sharing).
+        """
+        freed_blocks, skipped = self.block_pool.evict_blocks_derefed(block_ids)
+        return [b.block_id for b in freed_blocks], skipped
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

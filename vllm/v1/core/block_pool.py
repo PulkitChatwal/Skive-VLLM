@@ -459,6 +459,62 @@ class BlockPool:
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
 
+    def evict_blocks_derefed(
+        self, block_ids: set[int], prepend: bool = False
+    ) -> tuple[list[KVCacheBlock], list[int]]:
+        """SKIVE volatile-eviction: deref and free PRIVATE blocks only.
+
+        Only blocks with ``ref_cnt == 1`` are acted upon.  Blocks with
+        ``ref_cnt > 1`` are SKIPPED because they are part of the prefix
+        cache and may be shared with other in-flight sequences; SKIVE
+        must never break the prefix-cache invariant that a shared
+        block has consistent KV data.
+
+        For each private block, we set ``ref_cnt = 0`` and append it
+        to the free queue.  The block's hash entry in the prefix cache
+        is preserved; a future sequence that hits this prefix will
+        get a fresh KV copy (since the data has been overwritten by
+        the new requesting sequence).
+
+        Args:
+            block_ids: Physical block IDs to evict.
+            prepend: If True, freed blocks go to the head of the free
+                queue (reuse-priority).
+
+        Returns:
+            ``(freed, skipped)``:
+            freed: blocks that were actually freed.
+            skipped: block_ids that were skipped due to ``ref_cnt != 1``
+                (prefix-shared or null).  These must be removed from
+                the requesting sequence's block_table.
+        """
+        freed: list[KVCacheBlock] = []
+        skipped: list[int] = []
+        for block_id in block_ids:
+            if block_id >= len(self.blocks):
+                raise ValueError(
+                    f"Invalid block_id {block_id} >= {len(self.blocks)}. "
+                    f"This indicates a bug in SKIVE block selection."
+                )
+            block = self.blocks[block_id]
+            if block.is_null:
+                skipped.append(block_id)
+                continue
+            if block.ref_cnt != 1:
+                # ref_cnt > 1: prefix-shared; SKIVE must skip.
+                # ref_cnt == 0: already free.
+                skipped.append(block_id)
+                continue
+            # ref_cnt == 1: private to this request, safe to evict.
+            block.ref_cnt = 0
+            freed.append(block)
+        if freed:
+            if prepend:
+                self.free_block_queue.prepend_n(freed)
+            else:
+                self.free_block_queue.append_n(freed)
+        return freed, skipped
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalid prefix caching after the weights are updated,

@@ -138,6 +138,7 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.worker.skive_state import SkivePostprocess, SkiveState
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -685,6 +686,42 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
         )
+
+        # ---- SKIVE integration (Phase 3) ------------------------------
+        # SkiveState is the model-runner-side state container backing
+        # the SKIVE fused-decode eviction policy.  When SKIVE is
+        # disabled, this attribute stays None and every check below
+        # is a one-line `if self.skive_state is not None:` gate, so
+        # the standard vLLM path is byte-for-byte unchanged.
+        self.skive_state: SkiveState | None = None
+        self.skive_postprocess: SkivePostprocess | None = None
+        if self.cache_config.skive_enabled:
+            self.skive_state = SkiveState(
+                num_layers=self.model_config.get_num_layers(self.parallel_config),
+                num_kv_heads=self.model_config.get_num_kv_heads(self.parallel_config),
+                block_size=self.cache_config.block_size,
+                kv_budget=self.cache_config.skive_kv_budget,
+                num_sink_tokens=self.cache_config.skive_num_sink_tokens,
+                score_aggregation=self.cache_config.skive_score_aggregation,
+                score_ema_alpha=self.cache_config.skive_score_ema_alpha,
+                max_decode_reqs=self.max_num_reqs,
+                max_seq_len=self.max_model_len,
+                device=self.device,
+            )
+            self.skive_postprocess = SkivePostprocess(self.skive_state)
+            # SKIVE eviction targets from the most recent decode step.
+            # Filled by _skive_post_forward; consumed by the engine core
+            # after execute_model returns.  None when SKIVE is disabled
+            # or when the current step has no eviction candidate.
+            self.skive_pending_evictions: list[int] | None = None
+            # The number of layers that actually contribute scores to
+            # the per-step buffer.  In a transformer with N layers, the
+            # kernel runs once per layer and atomic-adds into the same
+            # buffer; after the model forward we divide by this count.
+            self.skive_num_score_layers = (
+                self.model_config.get_num_layers(self.parallel_config)
+            )
+        # ---- end SKIVE integration ------------------------------------
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -3995,6 +4032,69 @@ class GPUModelRunner(
         prefill chunk)."""
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
+def _skive_post_forward(
+        self,
+        attn_metadata,
+        score_buf: torch.Tensor,
+    ) -> None:
+        """Post-model-forward SKIVE block selection.
+
+        Runs after the transformer forward completes.  ``score_buf``
+        has been atomic-added into by the SKIVE fused-decode kernel
+        on every decoder layer.  We:
+
+        1) Mean-normalize by ``num_layers``.
+        2) Aggregate per-token scores into per-block scores.
+        3) Run a vectorized argmin over eligible blocks to select
+           one eviction target per request.
+        4) Store the selected block IDs in
+           ``self.skive_pending_evictions`` for the engine core to
+           pick up after ``execute_model`` returns.
+        5) Reset the per-token score buffer for the next decode step.
+
+        This implementation is CUDA-graph safe: no ``.item()`` calls
+        in the hot path.  The actual block deref happens in the
+        engine core process where the ``BlockPool`` lives.
+        """
+        assert self.skive_state is not None
+        postprocess = self.skive_state.postprocess
+
+        num_decode = int(attn_metadata.num_decode_tokens)
+        if num_decode == 0:
+            self.skive_pending_evictions = None
+            return
+
+        # Step 1: mean-normalize
+        postprocess.mean_normalize(score_buf, num_decode)
+
+        # Step 2: aggregate per-token -> per-block
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+        max_seq_len = int(attn_metadata.max_seq_len)
+        num_kv_heads = self.skive_state.num_kv_heads
+        postprocess.aggregate_block_scores_pure_cpu(
+            num_decode, max_seq_len, block_table, seq_lens, num_kv_heads,
+        )
+
+        # Step 3: select evictee block per request
+        num_sink_blocks = self.skive_state.num_sink_blocks
+        num_local_blocks = self.skive_state.num_local_blocks
+        evict_blocks = postprocess.select_eviction_blocks(
+            num_decode, seq_lens, block_table, num_sink_blocks, num_local_blocks,
+        )
+
+        # Step 4: stash eviction targets for engine core
+        # evict_blocks is a GPU int32 tensor.  Sync to CPU here (one
+        # tiny D2H copy per step is acceptable; it lives outside the
+        # CUDA-graph captured region).
+        evict_cpu = evict_blocks.cpu().tolist()
+        if any(b >= 0 for b in evict_cpu):
+            self.skive_pending_evictions = evict_cpu
+        else:
+            self.skive_pending_evictions = None
+
+        # Step 5: reset score buffer
+        postprocess.reset_score_buffer(num_decode)
 
     @torch.inference_mode()
     def execute_model(
@@ -5892,6 +5992,30 @@ class GPUModelRunner(
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
+
+            # ---- SKIVE post-forward hook (Phase 3) -----------------
+            # After all layers have processed, the per-step score
+            # buffer has been atomic-added into by the SKIVE kernel
+            # on every layer's decode pass.  We:
+            #   1) mean-normalize by num_layers (so the score is
+            #      a stable per-token L1-of-contribution, not a
+            #      per-layer-per-token sum)
+            #   2) run the per-request block-wise argmin Triton kernel
+            #      to find the lowest-scoring block per request
+            #   3) dereference the selected blocks via
+            #      KVCacheManager.evict_blocks_derefed() (Phase 5)
+            # The decode branch in flash_attn.py / triton_attn.py
+            # (Phase 4) populates attn_metadata.skive_score_buf during
+            # the forward pass; we read it back here.
+            if (self.skive_state is not None
+                    and attn_metadata.num_decode_tokens > 0):
+                score_buf = attn_metadata.skive_score_buf
+                if score_buf is not None:
+                    self._skive_post_forward(
+                        attn_metadata=attn_metadata,
+                        score_buf=score_buf,
+                    )
+            # ---- end SKIVE post-forward hook -----------------------
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()

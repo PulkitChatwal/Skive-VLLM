@@ -64,6 +64,82 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# ---- SKIVE PATCH (Phase 4) ------------------------------------
+# Imported lazily inside the decode path so this file's import
+# surface stays unchanged for the non-SKIVE code path.  The
+# SKIVE fused-decode kernel is a small Triton kernel that
+# computes attention output and per-token L1-of-contribution
+# scores in a single pass over the KV cache.
+try:
+    from vllm.attention.ops.skive_paged_decode import (
+        skive_paged_decode_attention,
+    )
+    _SKIVE_KERNEL_AVAILABLE = True
+except ImportError:
+    skive_paged_decode_attention = None  # type: ignore[assignment]
+    _SKIVE_KERNEL_AVAILABLE = False
+# ---- end SKIVE PATCH ------------------------------------------
+
+
+def _skive_decode_step(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: FlashAttentionMetadata,
+    layer_id: int,
+    scale: float,
+    out: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+) -> None:
+    """Run the SKIVE fused-decode kernel for one decoder layer.
+
+    The kernel produces the standard attention output and atomically
+    adds per-token L1-of-contribution scores into
+    ``attn_metadata.skive_score_buf`` (shape
+    ``[num_decode_reqs, max_seq_len, num_kv_heads]``).  Each layer's
+    call accumulates into the same buffer; the mean over layers is
+    taken in ``GPUModelRunner._skive_post_forward``.
+
+    Args:
+        query: ``[num_tokens, num_heads * head_size]`` packed query
+            tensor for the decode step.  ``num_tokens`` here equals
+            ``num_decode_tokens`` because we only dispatch when this
+            step is decode-only.
+        key_cache: ``[num_blocks, num_kv_heads, head_size, block_size]``
+        value_cache: same layout as ``key_cache``.
+        attn_metadata: the metadata for the current step.
+        layer_id: index of the current decoder layer (unused for
+            scoring, kept for symmetry / debugging).
+        scale: softmax scale = 1/sqrt(head_size).
+        out: preallocated output tensor with the same layout as
+            ``query``; the kernel writes the attention output here.
+        num_kv_heads: number of KV heads (for GQA).
+        head_size: per-head dimension.
+    """
+    num_decode_reqs = attn_metadata.num_decode_tokens
+    # SKIVE's paged-decode kernel expects one query per request.
+    # In vLLM V1 decode-only steps, query layout is exactly this:
+    # one token per request, contiguous along the batch dimension.
+    q_flat = query.view(num_decode_reqs, -1)  # [num_decode, num_heads * head_size]
+
+    # Call the SKIVE fused-decode kernel.  The kernel writes the
+    # attention output into ``out`` and atomically-adds per-token
+    # L1-of-contribution scores into ``attn_metadata.skive_score_buf``.
+    skive_paged_decode_attention(
+        q=q_flat,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=attn_metadata.block_table,
+        seq_lens=attn_metadata.seq_lens,
+        max_seq_len=attn_metadata.max_seq_len,
+        scale=scale,
+        score_buf=attn_metadata.skive_score_buf,
+        out=out,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+    )
+
 
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -244,6 +320,8 @@ class FlashAttentionMetadata:
     #                                   |-- query_len ---|
 
     num_actual_tokens: int  # Number of tokens excluding padding.
+    num_decode_tokens: int = 0  # Number of decode tokens (subset of actual).
+    num_prefill_tokens: int = 0  # Number of prefill tokens (subset of actual).
     max_query_len: int
     query_start_loc: torch.Tensor
     max_seq_len: int
@@ -272,6 +350,19 @@ class FlashAttentionMetadata:
     # PrefixLM bidirectional ranges for multimodal tokens.
     # Shape: (num_seqs, max_ranges, 2) int32, [start, end] per range.
     mm_prefix_range_tensor: torch.Tensor | None = None
+
+    # ---- SKIVE PATCH (Phase 4) ------------------------------------
+    # Per-step SKIVE score buffer.  Shape:
+    #   [num_decode_reqs, max_seq_len, num_kv_heads]   float32
+    # The SKIVE fused-decode kernel atomic-adds per-token L1-of-
+    # contribution scores into this buffer across all N layers
+    # during a single decode step.  After the model forward pass,
+    # GPUModelRunner._skive_post_forward() reads it back, mean-
+    # normalizes by num_layers, and dispatches block-level eviction.
+    # When SKIVE is disabled, this stays None and the standard
+    # flash_attn path is byte-for-byte unchanged.
+    skive_score_buf: torch.Tensor | None = None
+    # ---- end SKIVE PATCH ------------------------------------------
 
 
 def _get_sliding_window_configs(
@@ -747,6 +838,63 @@ class FlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # ---- SKIVE PATCH (Phase 4) --------------------------------
+        # SKIVE fused-decode dispatch.  Fires only when:
+        #   1) The SKIVE kernel is importable (built).
+        #   2) This is a decoder self-attention call (not encoder/
+        #      cross-attn).
+        #   3) num_actual_tokens equals num_decode_tokens (i.e. this
+        #      step is decode-only, no prefill tokens mixed in).
+        #   4) CacheConfig.skive_enabled is True.
+        # On the first decoder layer we allocate the per-step
+        # score buffer; subsequent layers atomic-add into it.  The
+        # buffer is consumed by GPUModelRunner._skive_post_forward()
+        # after the model forward completes.
+        if (
+            _SKIVE_KERNEL_AVAILABLE
+            and attn_metadata.num_decode_tokens > 0
+            and attn_metadata.num_decode_tokens
+            == attn_metadata.num_actual_tokens
+        ):
+            cfg = (
+                get_current_vllm_config_or_none()
+                or get_current_vllm_config()
+            )
+            if (
+                cfg is not None
+                and cfg.cache_config.skive_enabled
+            ):
+                # Allocate the score buffer on first decoder layer.
+                if attn_metadata.skive_score_buf is None:
+                    num_decode_reqs = attn_metadata.num_decode_tokens
+                    # Use the maximum sequence length seen in this step
+                    # as the buffer's L dimension.  This is a per-step
+                    # upper bound; positions past the request's seq_len
+                    # are simply not written.
+                    max_l = int(attn_metadata.max_seq_len)
+                    attn_metadata.skive_score_buf = torch.zeros(
+                        (
+                            num_decode_reqs,
+                            max_l,
+                            self.num_kv_heads,
+                        ),
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                _skive_decode_step(
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    attn_metadata=attn_metadata,
+                    layer_id=layer.layer_idx,
+                    scale=self.scale,
+                    out=output,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                )
+                return output
+        # ---- end SKIVE PATCH -------------------------------------
 
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):

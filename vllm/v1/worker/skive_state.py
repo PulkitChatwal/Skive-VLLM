@@ -114,6 +114,17 @@ class SkiveState:
         self.block_size = block_size
         self.kv_budget = int(kv_budget)
         self.num_sink_tokens = int(num_sink_tokens)
+        # Block-aligned versions used by select_eviction_blocks().
+        # These are derived from the token-level budgets, rounded up
+        # to a whole-block count.  Sinks + local_window in blocks
+        # should never overlap; we clamp local to leave at least one
+        # evictable middle block at the configured budget.
+        self.num_sink_blocks = max(
+            1, (self.num_sink_tokens + self.block_size - 1) // self.block_size
+        ) if self.num_sink_tokens > 0 else 0
+        # Default recency window: 1 block.  Configurable later via
+        # cache_config.skive_local_window_tokens.
+        self.num_local_blocks = 1
         self.score_aggregation = score_aggregation
         self.score_ema_alpha = float(score_ema_alpha)
         # Round budget down to a multiple of block_size for the
@@ -254,3 +265,121 @@ class SkivePostprocess:
         if num_decode_reqs == 0:
             return
         self.state.block_score[:num_decode_reqs, :max_blocks].zero_()
+
+    def aggregate_block_scores_pure_cpu(
+        self,
+        num_decode_reqs: int,
+        max_seq_len: int,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_kv_heads: int,
+    ) -> None:
+        """Sum per-token SKIVE scores into per-block scores, vectorized.
+
+        Uses ``scatter_add_`` to aggregate token-level scores into block-
+        level scores in a graph-safe, zero-.item() manner.  The output
+        shape is ``[num_decode_reqs, max_blocks]`` float32.
+        """
+        block_size = self.state.block_size
+        max_blocks = block_table.shape[1]
+
+        self.reset_block_score(num_decode_reqs, max_blocks)
+
+        s = self.state.s_buffer_3d[:num_decode_reqs, :max_seq_len, :num_kv_heads]
+        per_token = s.sum(dim=-1)                              # [num_decode, max_seq_len]
+
+        # Build flat scatter indices: for token t in req r, its block is t // block_size.
+        token_pos = torch.arange(max_seq_len, device=per_token.device)  # [max_seq_len]
+        req_offsets = (torch.arange(num_decode_reqs, device=per_token.device) * max_blocks).unsqueeze(1)  # [num_decode, 1]
+        block_idx = (token_pos.unsqueeze(0) // block_size).clamp(max=max_blocks - 1)  # [num_decode, max_seq_len]
+        flat_block_idx = (req_offsets + block_idx).reshape(-1)                       # [num_decode * max_seq_len]
+
+        # Mask out tokens beyond each request's seq_len
+        per_req_seq_len = seq_lens[:num_decode_reqs].unsqueeze(1)                    # [num_decode, 1]
+        valid = (token_pos.unsqueeze(0) < per_req_seq_len).to(per_token.dtype)       # [num_decode, max_seq_len]
+        values = (per_token * valid).reshape(-1)                                     # [num_decode * max_seq_len]
+
+        # scatter_add_ into a scratch buffer (resilient to non-contiguous
+        # views of the destination tensor), then copy back into the
+        # real block_score slice.
+        scratch = torch.zeros(
+            num_decode_reqs * max_blocks,
+            dtype=self.state.block_score.dtype,
+            device=self.state.block_score.device,
+        )
+        scratch.scatter_add_(0, flat_block_idx, values)
+        self.state.block_score[:num_decode_reqs, :max_blocks].copy_(
+            scratch.reshape(num_decode_reqs, max_blocks)
+        )
+
+        # Zero out blocks that don't exist for this request
+        # (e.g., for a seq of length 33 with block_size=16, blocks 2 holds only 1 token
+        #  but block_score at columns 3..max_blocks should be zero)
+        col_idx = torch.arange(max_blocks, device=per_token.device)                  # [max_blocks]
+        num_blocks_per_req = (seq_lens[:num_decode_reqs] + block_size - 1) // block_size  # [num_decode]
+        valid_cols = (col_idx.unsqueeze(0) < num_blocks_per_req.unsqueeze(1)).to(self.state.block_score.dtype)  # [num_decode, max_blocks]
+        self.state.block_score[:num_decode_reqs, :max_blocks].mul_(valid_cols)
+
+    def select_eviction_blocks(
+        self,
+        num_decode_reqs: int,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        num_sink_blocks: int,
+        num_local_blocks: int,
+    ) -> torch.Tensor:
+        """For each request, pick one block to evict (argmin of block_score).
+
+        Vectorized version: no ``.item()`` calls, no per-request Python
+        loop.  Uses masked argmin over the block_score tensor to find
+        the lowest-scoring block in the eligible middle range.
+
+        Protection rules:
+        - The first ``num_sink_blocks`` blocks of each request are sinks.
+        - The LAST ``num_local_blocks`` blocks of each request are
+          the recency window.
+        - Out-of-range blocks (beyond each request's actual num_blocks)
+          are masked to +inf so they never win argmin.
+
+        Returns:
+            ``evict_block_ids`` of shape ``[num_decode_reqs]`` int32, with
+            ``-1`` for requests that have no evictable block.
+        """
+        block_size = self.state.block_size
+        max_blocks = block_table.shape[1]
+        device = self.state.block_score.device
+
+        bs = self.state.block_score[:num_decode_reqs, :max_blocks]   # [num_decode, max_blocks]
+        bt = block_table[:num_decode_reqs, :max_blocks]               # [num_decode, max_blocks]
+
+        # Per-request num_blocks and eligible [start, end) ranges, all vectorized.
+        num_blocks_per_req = (seq_lens[:num_decode_reqs] + block_size - 1) // block_size  # [num_decode]
+        # Replace any negative seq_len with 0 (defensive)
+        num_blocks_per_req = num_blocks_per_req.clamp(min=0)
+        col_idx = torch.arange(max_blocks, device=device).unsqueeze(0)  # [1, max_blocks]
+
+        # Sink range: blocks [0, num_sink_blocks) are protected.
+        in_sink = col_idx < num_sink_blocks
+        # Local range: blocks [num_blocks - num_local_blocks, num_blocks) are protected.
+        # If num_blocks < num_local_blocks, all blocks are local.
+        local_start = (num_blocks_per_req - num_local_blocks).unsqueeze(1)  # [num_decode, 1]
+        in_local = col_idx >= local_start
+        # Out-of-range: blocks beyond num_blocks don't exist for this request.
+        out_of_range = col_idx >= num_blocks_per_req.unsqueeze(1)
+        # No eligible middle block when num_blocks <= num_sink_blocks + num_local_blocks.
+        no_middle = (num_blocks_per_req <= (num_sink_blocks + num_local_blocks)).unsqueeze(1)
+        # Eligible: NOT sink, NOT local, NOT out-of-range, NOT no_middle
+        protected = in_sink | in_local | out_of_range | no_middle  # [num_decode, max_blocks]
+
+        # Mask protected positions with +inf
+        masked = bs.masked_fill(protected, float("inf"))
+        # argmin across the block dimension
+        best_block_idx = torch.argmin(masked, dim=1)  # [num_decode], values in [0, max_blocks)
+        # Map to physical block IDs via the block_table
+        evict = torch.gather(bt, 1, best_block_idx.unsqueeze(1)).squeeze(1)  # [num_decode]
+        # For requests with no eligible block, set to -1
+        # (masked argmin returns 0 when all are +inf; we must use a sentinel)
+        # Use gather: if all positions are +inf, argmin returns 0, and we need to detect.
+        all_inf = protected.all(dim=1)  # [num_decode]
+        evict = torch.where(all_inf, torch.full_like(evict, -1), evict)
+        return evict.to(torch.int32)
