@@ -102,7 +102,9 @@ def build_paged_kv(
         device=k.device, dtype=k.dtype,
     )
     value_cache = torch.zeros_like(key_cache)
-    block_table = torch.zeros(num_seqs, blocks_per_seq, dtype=torch.int32, device=k.device)
+    block_table = torch.zeros(
+        num_seqs, blocks_per_seq, dtype=torch.int32, device=k.device
+    )
 
     phys_block = 0
     for s in range(num_seqs):
@@ -162,7 +164,9 @@ for seq_len, num_heads, num_kv_heads, head_size, block_size, label in configs:
     scale = 1.0 / math.sqrt(head_size)
 
     q = torch.randn(num_seqs, num_heads, head_size, device=DEVICE, dtype=DTYPE)
-    k = torch.randn(num_seqs, seq_len, num_kv_heads, head_size, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(
+        num_seqs, seq_len, num_kv_heads, head_size, device=DEVICE, dtype=DTYPE
+    )
     v = torch.randn_like(k)
 
     ref_out = reference_attention(q, k, v, scale)
@@ -171,7 +175,9 @@ for seq_len, num_heads, num_kv_heads, head_size, block_size, label in configs:
     seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device=DEVICE)
 
     out = torch.zeros(num_seqs, num_heads * head_size, device=DEVICE, dtype=DTYPE)
-    score_buf = torch.zeros(num_seqs, seq_len, num_kv_heads, device=DEVICE, dtype=torch.float32)
+    score_buf = torch.zeros(
+        num_seqs, seq_len, num_kv_heads, device=DEVICE, dtype=torch.float32
+    )
 
     q_flat = q.view(num_seqs, -1)
     skive_paged_decode_attention(
@@ -190,8 +196,11 @@ for seq_len, num_heads, num_kv_heads, head_size, block_size, label in configs:
 
     got_out = out.view(num_seqs, num_heads, head_size)
     max_err = (got_out.float() - ref_out.float()).abs().max().item()
-    print(f"  [{label}] seq_len={seq_len} H={num_heads}/H_kv={num_kv_heads} "
-          f"max_err={max_err:.4e}")
+    heads = f"{num_heads}/{num_kv_heads}"
+    print(
+        f"  [{label}] seq_len={seq_len} H={heads} "
+        f"max_err={max_err:.4e}"
+    )
     assert max_err < 1e-2, f"Output error too large for {label}: {max_err:.4e}"
 
 print("  [OK] All kernel correctness checks passed")

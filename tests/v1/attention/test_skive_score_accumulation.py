@@ -100,8 +100,12 @@ def test_score_accumulation_matches_recompute():
     seq_len = 64
 
     # Generate synthetic per-layer K,V (simulating a forward pass)
-    all_k = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
-    all_v = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
+    all_k = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
+    all_v = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
 
     # A single query tensor (this is what we get in decode: one
     # query token per head).
@@ -129,7 +133,8 @@ def test_score_accumulation_matches_recompute():
     assert mean_err < 1e-6, f"Mean error too large: {mean_err:.4e}"
     # The accumulated scores should be EXACTLY N times the
     # per-layer scores on average.
-    assert (accumulated.mean() / recompute.mean()).item() == pytest.approx(num_layers, abs=1e-5)
+    ratio = (accumulated.mean() / recompute.mean()).item()
+    assert ratio == pytest.approx(num_layers, abs=1e-5)
 
 
 def test_score_accumulation_with_gqa():
@@ -144,8 +149,12 @@ def test_score_accumulation_with_gqa():
     head_size = 64
     seq_len = 32
 
-    all_k = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
-    all_v = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
+    all_k = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
+    all_v = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
     q = torch.randn(num_heads, head_size, dtype=torch.float32)
     scale = 1.0 / math.sqrt(head_size)
 
@@ -170,8 +179,12 @@ def test_score_accumulation_mha():
     head_size = 128
     seq_len = 128
 
-    all_k = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
-    all_v = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
+    all_k = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
+    all_v = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
     q = torch.randn(num_heads, head_size, dtype=torch.float32)
     scale = 1.0 / math.sqrt(head_size)
 
@@ -196,8 +209,12 @@ def test_score_accumulation_single_layer():
     head_size = 64
     seq_len = 16
 
-    all_k = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
-    all_v = torch.randn(num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32)
+    all_k = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
+    all_v = torch.randn(
+        num_layers, seq_len, num_kv_heads, head_size, dtype=torch.float32
+    )
     q = torch.randn(num_heads, head_size, dtype=torch.float32)
     scale = 1.0 / math.sqrt(head_size)
 
